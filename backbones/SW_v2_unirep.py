@@ -608,4 +608,192 @@ def ShiftWise_v2_large(pretrained=False, in_22k=False, **kwargs):
 
     return model
 
+class CoordAtt(nn.Module):
+    """
+    Coordinate Attention (Improved)
+    - reduction 비율을 16으로 완화하여 정보 손실 최소화
+    - min_channels를 16으로 설정하여 최소한의 정보량 보장
+    """
+    def __init__(self, inp, oup, reduction=16):
+        super(CoordAtt, self).__init__()
+        # [수정] 너무 작은 채널로 압축되지 않도록 안전장치(max) 강화 (8 -> 16)
+        mip = max(16, inp // reduction)
 
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1)) 
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None)) 
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = get_bn(mip) 
+        self.act = nn.SiLU() 
+        
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y) 
+        
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_h * a_w
+        return out
+
+class Block_MVTec_Efficient(nn.Module):
+    r"""
+    MVTec AD Efficient Block (High Performance Ver.)
+    - Local Branch에 GroupNorm을 추가하여 학습 안정성 강화
+    """
+    def __init__(self, dim, drop_path=0.0, layer_scale_init_value=1e-6, 
+                 kernel_size=(7, 7), ghost_ratio=0.23, N_path=2, N_rep=4, 
+                 bn=True, deploy=False, use_lk_impl=True):
+        super().__init__()
+
+        # 1. Large Kernel (Global Context)
+        self.large_kernel = get_conv2d(in_channels=dim, out_channels=dim, big_kernel=kernel_size[0], 
+                                       small_kernel=kernel_size[1], stride=1, group=dim, bn=bn, 
+                                       ghost_ratio=ghost_ratio, N_path=N_path, N_rep=N_rep, use_lk_impl=use_lk_impl)
+
+        # 2. CoordAtt (IoU)
+        self.norm = get_bn(dim) if bn else LayerNorm(dim, eps=1e-6)
+        self.attention = CoordAtt(dim, dim, reduction=16) # [수정] reduction 32 -> 16
+
+        # 3. ConvFFN (Local Texture)
+        self.pwconv1 = nn.Sequential(NCHWtoNHWC(), nn.Linear(dim, 4 * dim))
+        
+        # [수정] Local Branch 강화: GroupNorm 추가
+        # 작은 Batch Size에서도 텍스처 특징을 안정적으로 추출하게 도움 (F1 Score 상승 요인)
+        self.local_dw = nn.Sequential(
+            NHWCtoNCHW(),
+            nn.Conv2d(4 * dim, 4 * dim, kernel_size=3, padding=1, groups=4 * dim, bias=False),
+            nn.GroupNorm(1, 4 * dim), # [New] LayerNorm 효과 (Channel-wise stability)
+            NCHWtoNHWC()
+        )
+
+        self.act = nn.Sequential(
+            nn.GELU(),
+            GRNwithNHWC(4 * dim, use_bias=not deploy)
+        )
+        
+        self.pwconv2 = nn.Sequential(
+            nn.Linear(4 * dim, dim, bias=False),
+            NHWCtoNCHW(),
+            get_bn(dim)
+        )
+
+        self.gamma = (
+            nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+            if layer_scale_init_value > 0 else None
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x):
+        input = x
+        x = self.large_kernel(x)
+        
+        if hasattr(self, 'norm'):
+             x = self.norm(x)
+             x = self.attention(x) 
+
+        x = self.pwconv1(x)     # Expansion
+        x = self.local_dw(x)    # Local Conv + GroupNorm
+        x = self.act(x)         # Activation
+        x = self.pwconv2(x)     # Projection
+
+        if self.gamma is not None:
+            x = self.gamma.view(1, -1, 1, 1) * x
+
+        x = input + self.drop_path(x)
+        return x
+
+    def reparameterize(self):
+        if hasattr(self.large_kernel, 'merge_branches'):
+            self.large_kernel.merge_branches()
+
+
+class ShiftWise_v2_MVTec_Efficient_Model(ShiftWise_v2):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+        depths = kwargs.get('depths', [3, 3, 9, 3])
+        dims = kwargs.get('dims', [96, 192, 384, 768])
+        width_factor = kwargs.get('width_factor', 1.0)
+        dims = [int(x * width_factor) for x in dims]
+        
+        drop_path_rate = kwargs.get('drop_path_rate', 0.0)
+        layer_scale_init_value = kwargs.get('layer_scale_init_value', 1e-6)
+        kernel_size = self.kernel_size 
+        ghost_ratio = kwargs.get('ghost_ratio', 0.23)
+        bn = kwargs.get('bn', True)
+        N_path = kwargs.get('N_path', 2)
+        N_rep = kwargs.get('N_rep', 4)
+
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        
+        self.stages = nn.ModuleList()
+        cur = 0
+        for i in range(4):
+            stage = nn.Sequential(
+                *[
+                    Block_MVTec_Efficient(
+                        dim=dims[i],
+                        drop_path=dp_rates[cur + j],
+                        layer_scale_init_value=layer_scale_init_value,
+                        kernel_size=(kernel_size[i], kernel_size[-1]),
+                        ghost_ratio=ghost_ratio,
+                        N_path=N_path,
+                        N_rep=N_rep,
+                        bn=bn,
+                        use_lk_impl=True
+                    )
+                    for j in range(depths[i])
+                ]
+            )
+            self.stages.append(stage)
+            cur += depths[i]
+            
+        self.apply(self._init_weights)
+        self.head.weight.data.mul_(kwargs.get('head_init_scale', 1.0))
+        self.head.bias.data.mul_(kwargs.get('head_init_scale', 1.0))
+
+    def forward_features(self, x):
+        outs = []
+        for i in range(4):
+            x = self.downsample_layers[i](x)
+            x = self.stages[i](x)
+            outs.append(x)
+        return tuple(outs)
+
+
+@register_model
+def ShiftWise_v2_tiny_mvtec(pretrained=False, **kwargs):
+    """
+    MVTec AD - High Performance Version
+    """
+    if 'kernel_size' not in kwargs:
+        kwargs['kernel_size'] = [51, 49, 45, 13, 3]
+        
+    # Ghost Ratio도 기본값으로 복구하여 채널 다양성 확보
+    if 'ghost_ratio' not in kwargs:
+        kwargs['ghost_ratio'] = 0.23
+        
+    if 'drop_path_rate' not in kwargs:
+        kwargs['drop_path_rate'] = 0.15 
+
+    model = ShiftWise_v2_MVTec_Efficient_Model(
+        depths=[3, 3, 18, 3], 
+        dims=[80, 160, 320, 640], 
+        **kwargs
+    )
+    
+    return model

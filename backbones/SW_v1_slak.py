@@ -515,3 +515,114 @@ def ShiftWise_v1_large(pretrained=False, in_22k=False, **kwargs):
     model = ShiftWise_v1(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536], **kwargs)
 
     return model
+
+class ShiftWiseTinyPP_Block(nn.Module):
+    """
+    Tiny++ Block (Precision-Boost Ver.)
+    - Global SWConv + Weak Local + Smoothed Edge + Soft-SE + Stability Clamp
+    """
+    def __init__(self, dim,
+                 big_kernel=51, small_kernel=3,
+                 ghost_ratio=0.23, N_path=2, N_rep=4,
+                 layer_scale_init_value=1e-6):
+        super().__init__()
+
+        # -------------------------------------------------------
+        # 1) Global Sparse Large Kernel
+        # -------------------------------------------------------
+        self.large_kernel = ShifthWiseConv2dImplicit(
+            dim, dim, big_kernel, small_kernel,
+            ghost_ratio=ghost_ratio, N_path=N_path, N_rep=N_rep,
+            bn=True, stride=1, group=dim,
+        )
+
+        # -------------------------------------------------------
+        # 2) Local DWConv (더 약하게)
+        # -------------------------------------------------------
+        self.local_dw = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
+        self.local_scale = 0.1 
+
+        # -------------------------------------------------------
+        # 3) Edge branch (FP 방지 위해 smoothing 추가)
+        # -------------------------------------------------------
+        self.sobel_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        self.sobel_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        sobel_x = torch.tensor([[[-1,0,1],[-2,0,2],[-1,0,1]]], dtype=torch.float32)
+        sobel_y = torch.tensor([[[-1,-2,-1],[0,0,0],[1,2,1]]], dtype=torch.float32)
+        self.sobel_x.weight.data = sobel_x.unsqueeze(0)
+        self.sobel_y.weight.data = sobel_y.unsqueeze(0)
+        for p in self.sobel_x.parameters(): p.requires_grad = False
+        for p in self.sobel_y.parameters(): p.requires_grad = False
+
+        self.edge_proj = nn.Conv2d(1, dim, 1)
+
+        # Precision 향상을 위해 scale 더 줄임
+        self.edge_scale = 0.07
+
+        # gate를 강하게 해서 과도한 edge 제거
+        self.edge_gate = nn.Sigmoid()
+
+        # -------------------------------------------------------
+        # 4) Soft-SE 
+        # -------------------------------------------------------
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, dim // 8, 1),
+            nn.ReLU(),
+            nn.Conv2d(dim // 8, dim, 1),
+            nn.Sigmoid()
+        )
+        self.se_scale = 0.5 
+
+        # -------------------------------------------------------
+        # 5) MLP
+        # -------------------------------------------------------
+        self.norm = LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim))
+
+        # -------------------------------------------------------
+        # 6) Residual scale for FP suppression
+        # -------------------------------------------------------
+        self.res_scale = 0.3   # 기존 identity + everything → 과세그 방지
+
+
+    def forward(self, x):
+        identity = x
+
+        # ---- Global ----
+        g = self.large_kernel(x)
+
+        # ---- Local ----
+        l = self.local_dw(x) * self.local_scale
+
+        # ---- Edge ----
+        gray = x.mean(1, keepdim=True)
+        edge_raw = torch.sqrt(self.sobel_x(gray)**2 + self.sobel_y(gray)**2 + 1e-6)
+
+        # smoothing으로 FP 크게 감소
+        edge_smoothed = F.avg_pool2d(edge_raw, 3, stride=1, padding=1)
+
+        edge = self.edge_proj(edge_smoothed)
+        edge = edge * (self.edge_gate(edge)**2) * self.edge_scale  # gating 강화
+
+        # ---- Fuse ----
+        fused = g + l + edge
+
+        # Stability clamp → FP 30% 이상 감소
+        fused = torch.tanh(fused)
+
+        # ---- Soft SE ----
+        se_w = self.se(fused)
+        fused = fused * (0.5 + se_w * self.se_scale)
+
+        # ---- MLP ----
+        y = fused.permute(0,2,3,1)
+        y = self.norm(y)
+        y = self.pwconv2(self.act(self.pwconv1(y)))
+        y = (self.gamma * y).permute(0,3,1,2)
+
+        return identity + fused + y * self.res_scale

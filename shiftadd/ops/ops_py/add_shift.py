@@ -6,15 +6,20 @@
 # 4. multi path multi rep with embedding --351
 '''
 
-# ops/ops_py/sum.py
+# ops/ops_py/add_shift.py
 import torch
 import math
+import torch.nn.functional as F
+
 import torch.nn as nn
 import numpy as np
 from torch.autograd import Function
 import addshift, addshiftmp, addshiftmp_linear, addshiftmp_em, addshiftmp_blur
 
 __all__ = ['AddShift_ops', 'AddShift_mp_module', 'AddShift_mp_linear_module', 'AddShift_mp_embedding_module', 'AddShift_mp_blur_module']
+
+def get_bn(channels):
+    return nn.BatchNorm2d(channels)
 
 # 1. single path
 class AddShift(torch.autograd.Function):
@@ -31,8 +36,10 @@ class AddShift(torch.autograd.Function):
         ctx.isH = isH
         inputs = inputs.contiguous()
         ctx.save_for_backward(idxes, pads)
-        out = torch.empty((B, C_out, H_out, W_out), device='cuda', 
-                         memory_format=torch.contiguous_format) 
+        out = torch.empty((B, C_out, H_out, W_out),
+                        device=torch.device('cuda'),
+                        memory_format=torch.contiguous_format)
+
         addshift.forward(out,inputs,idxes,pads,extra_pad, B, C_in,  H_in, W_in, C_out, H_out, W_out,isH)
         return out
 
@@ -81,7 +88,8 @@ class AddShiftMp(torch.autograd.Function):
         #       'W_out', W_out, '\n',
         #       'group_in',group_in)
         out = torch.empty((B*group_out, C_out, H_out, W_out), device='cuda',
-                         memory_format=torch.contiguous_format).zero_()
+                        memory_format=torch.contiguous_format).zero_()
+
         addshiftmp.forward(out,inputs, pad_hv, idx_identit, idx_out, extra_pad, B, C_in,  H_in, W_in, C_out, H_out, W_out, group_in)
         return out
  
@@ -168,9 +176,11 @@ class AddShift_mp_module(nn.Module):
             self.idx_identit = self.idx_identit.to(self.device)
             self.idx_out = self.idx_out.to(self.device)
 
+        B = x.shape[0]
         out = AddShift_mp_ops(x, self.pad_hv, self.idx_identit, self.idx_out,
-                              self.extra_pad, b, self.c_in, x_hin, x_win,
-                              self.c_out, hout, wout, self.group_in)
+                            self.extra_pad, B, self.c_in, x_hin, x_win,
+                            self.c_out, hout, wout, self.group_in)
+
         x,y,z = torch.chunk(out, 3, dim=0) 
         return x,y,z
     
@@ -223,8 +233,10 @@ class AddShiftMp_linear(torch.autograd.Function):
         #       'H_out',  H_out,'\n',
         #       'W_out', W_out, '\n',
         #       'group_in',group_in)
-        out = torch.empty((B*group_out, C_out, H_out, W_out), device='cuda',
-                         memory_format=torch.contiguous_format).zero_()
+        out = torch.empty((B*group_out, C_out, H_out, W_out),
+                        device=torch.device('cuda'),
+                        memory_format=torch.contiguous_format).zero_()
+
         addshiftmp_linear.forward(out,inputs, pad_hv, idx_identit, idx_out, extra_pad, B, C_in,  H_in, W_in, C_out, H_out, W_out, group_in,w1,w2,w3)
         return out
  
@@ -342,11 +354,12 @@ class AddShift_mp_linear_module(nn.Module):
         #     self.pad_hv = self.pad_hv.to(self.device)
         #     self.idx_identit = self.idx_identit.to(self.device)
         #     self.idx_out = self.idx_out.to(self.device)
-
+        B = x.shape[0]
         out = AddShiftMp_linear_ops(x, self.pad_hv, self.idx_identit, self.idx_out,
-                                    self.extra_pad, b, self.c_in, hin, win,
+                                    self.extra_pad, B, self.c_in, hin, win,
                                     self.c_out, hout, wout, self.group_in,
                                     self.w1, self.w2, self.w3)
+
         x,y,z = torch.chunk(out, 3, dim=0) 
         return x,y,z
     
@@ -500,10 +513,12 @@ class AddShift_mp_embedding_module(nn.Module):
         #     self.w2 = self.w2.to(self.device) # path 2
         #     self.w3 = self.w3.to(self.device) # small
 
+        B = x.shape[0]
         out = AddShiftMp_embedding_ops(x, self.pad_hv, self.idx_identit, self.idx_out,
-                                    self.extra_pad, b, self.c_in, hin, win,
+                                    self.extra_pad, B, self.c_in, hin, win,
                                     self.c_out, hout, wout, self.group_in,
                                     self.w1, self.w2, self.w3)
+
         x,y,z = torch.chunk(out, 3, dim=0) 
         return x,y,z
     
@@ -558,8 +573,10 @@ class AddShiftMpBlur(torch.autograd.Function):
         #       'H_out',  H_out,'\n',
         #       'W_out', W_out, '\n',
         #       'group_in',group_in)
-        out = torch.empty((B*group_out, C_out, H_out, W_out), device='cuda',
-                         memory_format=torch.contiguous_format).zero_()
+        out = torch.empty((B*group_out, C_out, H_out, W_out),
+                        device=torch.device('cuda'),
+                        memory_format=torch.contiguous_format).zero_()
+
         addshiftmp_blur.forward(out,inputs, pad_hv, idx_identit, idx_out, small_kernel, extra_pad, B, C_in,  H_in, W_in, C_out, H_out, W_out, group_in)
         return out
  
@@ -655,19 +672,33 @@ class AddShift_mp_blur_module(nn.Module):
         return extra_pad, pad_hv.contiguous(), identity_idxs.contiguous()
      
     def forward(self, x, b, hout, wout):
-        x_hin, x_win = hout + 2*self.extra_pad, wout + 2*self.extra_pad
+        # 기존 코드
+        # x_hin, x_win = hout + 2*self.extra_pad, wout + 2*self.extra_pad
+
+        # 수정 코드: 패딩 조정
+        x_hin, x_win = hout, wout  # 일단 동일 크기에서 시작
+        if self.extra_pad > 0:
+            pad = self.extra_pad
+            # 좌우/상하 대칭 패딩 적용
+            x = torch.nn.functional.pad(x, (pad, pad, pad, pad), mode="replicate")
+
         if self.device is None:
             device = x.device
-            self.device=device
-            self.pad_hv = self.pad_hv.to(self.device)
-            self.idx_identit = self.idx_identit.to(self.device)
-            self.idx_out = self.idx_out.to(self.device)
+            self.device = device
+            self.pad_hv = self.pad_hv.to(device)
+            self.idx_identit = self.idx_identit.to(device)
+            self.idx_out = self.idx_out.to(device)
 
-        out = AddShift_mp_blur_ops(x, self.pad_hv, self.idx_identit, self.idx_out,
-                              self.small_kernel, self.extra_pad, b, self.c_in, x_hin, x_win,
-                              self.c_out, hout, wout, self.group_in)
-        x,y,z = torch.chunk(out, 3, dim=0) 
-        return x,y,z
+        B = x.shape[0]
+        out = AddShift_mp_blur_ops(
+            x, self.pad_hv, self.idx_identit, self.idx_out,
+            self.small_kernel, self.extra_pad, B, self.c_in,
+            x.shape[2], x.shape[3],  # 실제 padded height, width
+            self.c_out, hout, wout, self.group_in
+        )
+
+        x1, x2, x3 = torch.chunk(out, 3, dim=0)
+        return x1, x2, x3
     
     def shift(self, kernels):
         '''
@@ -687,3 +718,115 @@ class AddShift_mp_blur_module(nn.Module):
             real_pad.append(extra_pad)
         return padding, real_pad
 
+# === NEW: Local-boosted ShiftWise (segmentation-friendly) ===
+class ShifthWiseConv2d_LF(nn.Module):
+    """
+    AddShift_mp_blur_module 개선 버전 (Local Feature 강화 + 연산량 동일 수준)
+    - Global: AddShift_mp_blur_ops (출력: c_out, hout×wout)
+    - Local : per-channel scaling + 1x1 proj -> c_out, 그리고 (hout×wout)로 맞춤
+    - Fuse  : learnable alpha
+    """
+    def __init__(self, big_kernel, small_kernel, c_out, c_in, group_in):
+        super().__init__()
+        self.device = None
+        self.c_in = c_in
+        self.c_out = c_out
+        self.group_in = group_in
+        self.nk = math.ceil(big_kernel / small_kernel)
+        self.kernels = (small_kernel, big_kernel)
+        self.small_kernel = small_kernel
+
+        # 기존 shuffle/pad 인덱스 생성
+        self.extra_pad, pad_hv, idx_identit = self.shuffle_idx_2_gen_pads(
+            small_kernel, c_out, group_in
+        )
+        idx_out = torch.IntTensor([[i] * self.nk for i in range(c_out)]).reshape(-1)
+        self.register_buffer("pad_hv", pad_hv)
+        self.register_buffer("idx_identit", idx_identit)
+        self.register_buffer("idx_out", idx_out)
+
+        # Local 경량 모듈(연산량 거의 0)
+        self.local_scale = nn.Parameter(torch.ones(1, c_in, 1, 1))
+        self.local_bias  = nn.Parameter(torch.zeros(1, c_in, 1, 1))
+        # 채널 맞춤( c_in -> c_out )
+        self.local_proj  = nn.Conv2d(c_in, c_out, kernel_size=1, bias=False)
+
+        # Fuse 가중치
+        self.fuse_alpha  = nn.Parameter(torch.tensor(0.7))
+
+    # ---- 기존 유틸 그대로 ----
+    def shuffle_idx_2_gen_pads(self, small_kernel, c_out, group_in):
+        padding, real_pad = self.shift(self.kernels)
+        extra_pad = padding - small_kernel // 2
+        shuffle_idx_horizon = [torch.cat([torch.randperm(self.nk) + i * self.nk for i in range(c_out)]).int() for _ in range(group_in)]
+        shuffle_idx_vertica = [torch.cat([torch.randperm(self.nk) + i * self.nk for i in range(c_out)]).int() for _ in range(group_in)]
+        pad_horizon, pad_vertica = [], []
+        identity_idxs=[]
+        for _ in range(group_in):
+            tmp_identity_idxs=[]
+            for i in range(c_out):
+                identity_idx=(torch.zeros(self.nk)-1).long()
+                pick = min(4, self.nk)
+                i_idx = np.random.choice(self.nk, pick, replace=False).tolist()
+                identity_idx[i_idx] = torch.arange(pick)
+                tmp_identity_idxs.append(identity_idx)
+            identity_idxs.append(torch.cat(tmp_identity_idxs).int())
+        identity_idxs = torch.transpose(torch.stack(identity_idxs), 0, 1)
+
+        idx_offset = torch.IntTensor(real_pad*c_out)
+        for i in range(group_in):
+            _, idx_h = torch.sort(shuffle_idx_horizon[i])
+            _, idx_v = torch.sort(shuffle_idx_vertica[i])
+            pad_horizon.append(torch.index_select(idx_offset, 0, idx_h))
+            pad_vertica.append(torch.index_select(idx_offset, 0, idx_v))
+        pad_horizon, pad_vertica = torch.stack(pad_horizon), torch.stack(pad_vertica)
+        pad_hv = torch.vstack([pad_horizon, pad_vertica])
+        pad_hv = torch.transpose(pad_hv, 0, 1)
+        return extra_pad, pad_hv.contiguous(), identity_idxs.contiguous()
+
+    def shift(self, kernels):
+        mink, maxk = min(kernels), max(kernels)
+        nk = math.ceil(maxk / mink)
+        padding = mink - 1
+        mid = maxk // 2
+        real_pad = [mid - i * mink - padding for i in range(nk)]
+        return padding, real_pad
+
+    def forward(self, x, b, hout, wout):
+        # 1) 패딩(글로벌 경로 입력과 일치)
+        if self.extra_pad > 0:
+            p = self.extra_pad
+            x_padded = F.pad(x, (p, p, p, p), mode="replicate")
+        else:
+            x_padded = x
+
+        if self.device is None:
+            self.device = x.device
+            self.pad_hv = self.pad_hv.to(x.device)
+            self.idx_identit = self.idx_identit.to(x.device)
+            self.idx_out = self.idx_out.to(x.device)
+
+        B = x_padded.shape[0]
+
+        # 2) Global 경로 (출력: [B, c_out, hout, wout])
+        out = AddShift_mp_blur_ops(
+            x_padded, self.pad_hv, self.idx_identit, self.idx_out,
+            self.small_kernel, self.extra_pad, B, self.c_in,
+            x_padded.shape[2], x_padded.shape[3],
+            self.c_out, hout, wout, self.group_in
+        )
+        x1, x2, x3 = torch.chunk(out, 3, dim=0)
+        global_feat = (x1 + x2 + x3) / 3
+
+        # 3) Local 경로 (입력: x_padded -> scale/bias -> (hout,wout) -> 1x1로 c_out 맞춤)
+        local_feat = x_padded * (self.local_scale + 1e-5) + self.local_bias
+        if local_feat.shape[-2:] != (hout, wout):
+            local_feat = F.interpolate(local_feat, size=(hout, wout), mode="bilinear", align_corners=False)
+        local_feat = self.local_proj(local_feat)
+
+        # 4) Fuse (크기 안전장치)
+        if global_feat.shape[-2:] != local_feat.shape[-2:]:
+            global_feat = F.interpolate(global_feat, size=local_feat.shape[-2:], mode="bilinear", align_corners=False)
+
+        out = self.fuse_alpha * global_feat + (1 - self.fuse_alpha) * local_feat
+        return out
