@@ -12,15 +12,15 @@ _base_ = [
     '../_base_/schedules/schedule_1x.py', '../_base_/default_runtime.py'
 ]
 
-checkpoint_file = '/root/checkpoint-best.pth'
+#input your path
+checkpoint_file = ''
 dims = [80, 160, 320, 640]
 
 model = dict(
-    pretrained='',
     backbone=dict(
         type='ShiftWise_v2',
         in_chans=3,
-        depths=[3, 3, 18, 3], 
+        depths=[3, 3, 9, 3], 
         dims=dims, 
         drop_path_rate=0.4,
         layer_scale_init_value=1.0,
@@ -138,7 +138,15 @@ train_pipeline = [
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks']),
 ]
 # We use 8 GPUs to train this model so that the total batch size was 16
-data = dict(train=dict(pipeline=train_pipeline), samples_per_gpu=2, workers_per_gpu=2)
+data = dict(
+    train=dict(
+        ann_file='/home/dtlab/autodl-tmp/coco2017/mmdetection/data/coco/annotations/instances_train2017_5k.json',
+        img_prefix='/home/dtlab/autodl-tmp/coco2017/mmdetection/data/coco/train2017_5k/',
+        pipeline=train_pipeline
+    ),
+    samples_per_gpu=1,
+    workers_per_gpu=2
+)
 
 optimizer = dict(constructor='LearningRateDecayOptimizerConstructor', _delete_=True, type='AdamW',
                  lr=0.0001, betas=(0.9, 0.999), weight_decay=0.05,
