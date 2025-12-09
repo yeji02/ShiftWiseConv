@@ -76,20 +76,20 @@ We have organized the downstream tasks into separate directories. This includes 
 * **Framework:** MMDetection v2.28.2
 * **Dataset:** MS COCO 2017
 * **Status:** Reproduced
-* 👉 **[Detailed Instructions](detection/README.md)**
+* 👉 **[Detailed Instructions](downstream/detection/README.md)**
 
 ### 2. Semantic Segmentation (ADE20K)
 * **Framework:** MMSegmentation v0.30.0
 * **Dataset:** ADE20K 2016
 * **Status:** Reproduced
-* 👉 **[Detailed Instructions](segmentation/README.md)**
+* 👉 **[Detailed Instructions](downstream/segmentation/README.md)**
 
 ### 3. Anomaly Detection (MVTec AD) [New!]
 * **Framework:** Custom PyTorch Implementation (U-Net based)
 * **Dataset:** MVTec AD
 * **Status:** **Extended Experiment**
 * We applied ShiftwiseConv as a backbone for Anomaly Segmentation tasks.
-* 👉 **[Detailed Instructions](anomaly/README.md)**
+* 👉 **[Detailed Instructions](downstream/anomaly/README.md)**
 
 > **Common Troubleshooting:**
 > If you encounter `UserWarning: semaphore_tracker: There appear to be 4 leaked semaphores`, run:
